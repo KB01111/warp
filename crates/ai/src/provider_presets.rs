@@ -8,7 +8,7 @@
 //! identifies which of the provider's models are free are all known up front.
 //!
 //! The dynamic half (asking the provider's `/models` endpoint what it currently
-//! serves) lives in [`crate::provider_models`]. Keeping the catalog parsing and
+//! serves) lives in `crate::provider_models`. Keeping the catalog parsing and
 //! free-model filtering here makes the interesting logic pure and testable
 //! without network access, and keeps it compiling on every target.
 //!
