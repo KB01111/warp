@@ -6,6 +6,9 @@ pub mod geap_credentials;
 pub mod grok_subscription;
 pub mod llm_id;
 pub mod llm_provider;
+#[cfg(not(target_family = "wasm"))]
+pub mod provider_models;
+pub mod provider_presets;
 
 pub use llm_id::LLMId;
 pub use llm_provider::LLMProvider;

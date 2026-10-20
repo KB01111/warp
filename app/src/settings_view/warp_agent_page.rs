@@ -16,6 +16,7 @@ use std::time::Duration;
 use ::ai::api_keys::{
     ApiKeyManager, ApiKeyManagerEvent, ApiKeys, ChatGPTConnectFailure, CustomEndpointParams,
 };
+use ::ai::provider_presets::PROVIDER_PRESETS;
 #[cfg(not(target_family = "wasm"))]
 use ::ai::grok_subscription::oauth::{
     self, ManualCodeExchange, OauthCancellationHandle, TokenResponse,
@@ -1593,6 +1594,53 @@ impl WarpAgentPageView {
         ctx.notify();
     }
 
+    /// Opens the endpoint editor for a built-in provider preset. If the user
+    /// already connected that provider (same base URL), this edits the existing
+    /// endpoint instead of creating a duplicate.
+    fn show_provider_preset_modal(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !Self::can_use_custom_inference_controls(ctx) {
+            return;
+        }
+        let Some(preset) = PROVIDER_PRESETS.get(index) else {
+            return;
+        };
+        let existing_index = ApiKeyManager::as_ref(ctx)
+            .custom_endpoints()
+            .iter()
+            .position(|endpoint| preset.matches_base_url(&endpoint.url));
+
+        self.remove_custom_endpoint_confirmation_dialog
+            .update(ctx, |dialog, ctx| {
+                dialog.hide(ctx);
+            });
+        self.pending_remove_custom_endpoint_index = None;
+
+        match existing_index {
+            Some(endpoint_index) => {
+                let Some(endpoint) = ApiKeyManager::as_ref(ctx)
+                    .custom_endpoints()
+                    .get(endpoint_index)
+                    .cloned()
+                else {
+                    return;
+                };
+                self.custom_endpoint_modal_state
+                    .set_title(Some(format!("Edit {}", preset.display_name)), ctx);
+                self.custom_endpoint_modal_state
+                    .prefill(Some(&endpoint), Some(endpoint_index), ctx);
+            }
+            None => {
+                self.custom_endpoint_modal_state
+                    .set_title(Some(format!("Connect {}", preset.display_name)), ctx);
+                self.custom_endpoint_modal_state.prefill_preset(preset, ctx);
+            }
+        }
+
+        self.custom_endpoint_modal_state.open(ctx);
+        ctx.emit(WarpAgentPageEvent::ShowModal);
+        ctx.notify();
+    }
+
     fn hide_custom_endpoint_modal(&mut self, ctx: &mut ViewContext<Self>) {
         self.custom_endpoint_modal_state.close(ctx);
         ctx.emit(WarpAgentPageEvent::HideModal);
@@ -2583,6 +2631,9 @@ pub enum WarpAgentPageAction {
     // Custom inference
     OpenAddCustomEndpointModal,
     OpenEditCustomEndpointModal(usize),
+    /// Opens the endpoint editor prefilled for the provider preset at this
+    /// index into `ai::provider_presets::PROVIDER_PRESETS`.
+    OpenProviderPresetModal(usize),
     ConnectGrokSubscription,
     CancelGrokSubscriptionConnect,
     DisconnectGrokSubscription,
@@ -3097,6 +3148,9 @@ impl TypedActionView for WarpAgentPageView {
             }
             WarpAgentPageAction::OpenEditCustomEndpointModal(index) => {
                 self.show_edit_custom_endpoint_modal(*index, ctx);
+            }
+            WarpAgentPageAction::OpenProviderPresetModal(index) => {
+                self.show_provider_preset_modal(*index, ctx);
             }
             WarpAgentPageAction::ToggleCloudHandoff => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -5033,6 +5087,10 @@ struct ApiKeysWidget {
     can_use_warp_credits_for_fallback: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
 
+    /// One click target per entry in [`PROVIDER_PRESETS`], so each preset row
+    /// keeps stable hover/press state across re-renders.
+    preset_connect_mouse_states: Vec<MouseStateHandle>,
+
     description_learn_more_index: HighlightedHyperlink,
 }
 
@@ -5297,6 +5355,11 @@ impl ApiKeysWidget {
             can_use_warp_credits_for_fallback: Default::default(),
             upgrade_highlight_index: Default::default(),
 
+            preset_connect_mouse_states: PROVIDER_PRESETS
+                .iter()
+                .map(|_| MouseStateHandle::default())
+                .collect(),
+
             description_learn_more_index: Default::default(),
         }
     }
@@ -5499,6 +5562,108 @@ impl ApiKeysWidget {
             .with_margin_top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
             .with_margin_bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
             .with_margin_right(styles::TOGGLE_WIDTH_MARGIN)
+            .finish()
+    }
+
+    /// Rows for the built-in provider presets (OpenRouter, NVIDIA Build,
+    /// OpenCode Zen/Go). Each row opens the endpoint editor prefilled with the
+    /// provider's base URL, from where its free model catalog can be fetched.
+    fn render_provider_presets(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let endpoints = ApiKeyManager::as_ref(app).custom_endpoints();
+        let text_color = styles::header_font_color(true, app);
+        let description_color = styles::description_font_color(true, app);
+
+        let mut column = Flex::column().with_spacing(12.);
+        column.add_child(
+            Container::new(
+                Text::new(
+                    "Connect a provider to use its free models with your own API key. Warp fills in the endpoint and can load the provider's current free model catalog.",
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_color(description_color.into())
+                .soft_wrap(true)
+                .finish(),
+            )
+            .with_margin_bottom(4.)
+            .finish(),
+        );
+
+        for (index, preset) in PROVIDER_PRESETS.iter().enumerate() {
+            let is_connected = endpoints
+                .iter()
+                .any(|endpoint| preset.matches_base_url(&endpoint.url));
+            let button_label = if is_connected { "Edit" } else { "Connect" };
+            let button = appearance
+                .ui_builder()
+                .button(
+                    ButtonVariant::Secondary,
+                    self.preset_connect_mouse_states
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .with_text_label(button_label.to_owned())
+                .with_style(UiComponentStyles {
+                    font_size: Some(14.),
+                    padding: Some(Coords::uniform(6.).left(12.).right(12.)),
+                    ..Default::default()
+                })
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WarpAgentPageAction::OpenProviderPresetModal(index));
+                })
+                .finish();
+
+            let label = Flex::column()
+                .with_spacing(2.)
+                .with_child(
+                    Text::new_inline(
+                        preset.display_name,
+                        appearance.ui_font_family(),
+                        CONTENT_FONT_SIZE,
+                    )
+                    .with_color(text_color.into())
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .finish(),
+                )
+                .with_child(
+                    Text::new(
+                        preset.description,
+                        appearance.ui_font_family(),
+                        CONTENT_FONT_SIZE,
+                    )
+                    .with_color(description_color.into())
+                    .soft_wrap(true)
+                    .finish(),
+                )
+                .finish();
+
+            let row = Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(12.)
+                .with_child(Shrinkable::new(1., label).finish())
+                .with_child(button)
+                .finish();
+
+            column.add_child(
+                Container::new(row)
+                    .with_uniform_padding(12.)
+                    .with_background(internal_colors::fg_overlay_1(theme))
+                    .with_border(
+                        Border::all(1.).with_border_fill(internal_colors::fg_overlay_3(theme)),
+                    )
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish(),
+            );
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(16.)
             .finish()
     }
 
@@ -5912,7 +6077,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = WarpAgentPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt custom inference endpoint grok supergrok xai chatgpt subscription plan"
+        "api keys bring your own byo openai anthropic google claude gemini gpt custom inference endpoint grok supergrok xai chatgpt subscription plan openrouter nvidia nvidia build opencode opencode zen opencode go free models"
     }
 
     fn should_render(&self, app: &AppContext) -> bool {
@@ -5960,6 +6125,12 @@ impl SettingsWidget for ApiKeysWidget {
                 provider_keys_enabled,
                 app,
             ));
+        }
+
+        // Preset providers: one "Connect" row per built-in provider. Connecting
+        // one creates a regular custom endpoint pre-pointed at the provider.
+        if custom_inference_controls_enabled {
+            column.add_child(self.render_provider_presets(app));
         }
 
         // Custom endpoints sub-label + list (only when flag on and endpoints non-empty)
