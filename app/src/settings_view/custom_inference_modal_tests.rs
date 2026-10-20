@@ -1,4 +1,5 @@
 use ai::api_keys::{CustomEndpointModel, CustomEndpointSchema};
+use ai::provider_presets::OPENROUTER;
 use pathfinder_geometry::vector::vec2f;
 use warpui::platform::WindowStyle;
 use warpui::scene::Scene;
@@ -335,6 +336,61 @@ fn selecting_schema_is_reflected_in_saved_schema() {
                 CustomEndpointSchema::AnthropicMessages,
                 "schema chosen in the dropdown should be what save() persists"
             );
+        });
+    })
+}
+
+#[test]
+fn prefill_preset_fills_provider_details() {
+    App::test((), |mut app| async move {
+        init_modal_test_models(&mut app);
+        let (_window_id, modal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            CustomEndpointModal::new(None, None, ctx)
+        });
+
+        modal.update(&mut app, |modal, ctx| {
+            modal.prefill_preset(&OPENROUTER, ctx);
+
+            assert_eq!(
+                modal.endpoint_name_editor.as_ref(ctx).buffer_text(ctx),
+                "OpenRouter"
+            );
+            assert_eq!(
+                modal.endpoint_url_editor.as_ref(ctx).buffer_text(ctx),
+                "https://openrouter.ai/api/v1"
+            );
+            assert_eq!(modal.api_key_editor.as_ref(ctx).buffer_text(ctx), "");
+            assert_eq!(modal.schema, CustomEndpointSchema::OpenaiChatCompletions);
+            assert_eq!(
+                modal.preset(ctx).map(|preset| preset.id),
+                Some("openrouter")
+            );
+            assert_eq!(modal.fetch_state, FetchState::Idle);
+            assert_eq!(
+                modal.model_rows.len(),
+                1,
+                "a preset starts with a single empty model row"
+            );
+        });
+    })
+}
+
+#[test]
+fn prefill_clears_fetch_state_and_preset_match() {
+    App::test((), |mut app| async move {
+        init_modal_test_models(&mut app);
+        let (_window_id, modal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            CustomEndpointModal::new(None, None, ctx)
+        });
+
+        modal.update(&mut app, |modal, ctx| {
+            modal.prefill_preset(&OPENROUTER, ctx);
+            modal.fetch_state = FetchState::Failed("boom".to_owned());
+
+            modal.prefill(None, None, ctx);
+
+            assert_eq!(modal.fetch_state, FetchState::Idle);
+            assert!(modal.preset(ctx).is_none());
         });
     })
 }

@@ -1,4 +1,5 @@
 use ::ai::api_keys::{CustomEndpoint, CustomEndpointSchema, validate_custom_endpoint_url};
+use ::ai::provider_presets::{ProviderPreset, preset_for_base_url};
 use warp_editor::editor::NavigationKey;
 use warpui::elements::{
     Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
@@ -77,6 +78,25 @@ pub enum CustomEndpointModalAction {
     RemoveModel(usize),
     RemoveEndpoint,
     SetSchema(CustomEndpointSchema),
+    /// Loads the free model catalog from the preset provider matching the
+    /// current endpoint URL.
+    FetchModels,
+}
+
+/// Progress of a live model-catalog fetch from a preset provider.
+///
+/// Only `Idle` is constructed on wasm (where catalog discovery is unavailable),
+/// so the other variants are allowed to go unconstructed on that target.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum FetchState {
+    #[default]
+    Idle,
+    Loading,
+    /// `shown` is capped at the number of rows we are willing to materialize;
+    /// `total` is how many free models the provider reported.
+    Loaded { shown: usize, total: usize },
+    Failed(String),
 }
 
 struct ModelRow {
@@ -93,6 +113,10 @@ pub struct CustomEndpointModal {
     schema_dropdown: ViewHandle<Dropdown<CustomEndpointModalAction>>,
     schema: CustomEndpointSchema,
     model_rows: Vec<ModelRow>,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fetch_state: FetchState,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fetch_button_mouse_state: MouseStateHandle,
     cancel_button_mouse_state: MouseStateHandle,
     save_button_mouse_state: MouseStateHandle,
     add_model_button_mouse_state: MouseStateHandle,
@@ -273,6 +297,8 @@ impl CustomEndpointModal {
             schema_dropdown,
             schema,
             model_rows,
+            fetch_state: FetchState::Idle,
+            fetch_button_mouse_state: Default::default(),
             cancel_button_mouse_state: Default::default(),
             save_button_mouse_state: Default::default(),
             add_model_button_mouse_state: Default::default(),
@@ -347,6 +373,7 @@ impl CustomEndpointModal {
     ) {
         self.editing_index = editing_index;
         self.scroll_state = Default::default();
+        self.fetch_state = FetchState::Idle;
         self.endpoint_name_editor.update(ctx, |editor, ctx| {
             editor.set_buffer_text(endpoint.map(|e| e.name.as_str()).unwrap_or(""), ctx);
         });
@@ -407,12 +434,48 @@ impl CustomEndpointModal {
         }
     }
 
+    /// Prefills the form from a built-in provider preset: name, base URL, and
+    /// request schema are known up front, leaving the API key to the user. The
+    /// model rows start empty so the catalog can be fetched.
+    pub fn prefill_preset(&mut self, preset: &ProviderPreset, ctx: &mut ViewContext<Self>) {
+        self.prefill(None, None, ctx);
+        self.endpoint_name_editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text(preset.display_name, ctx);
+        });
+        self.endpoint_url_editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text(preset.base_url, ctx);
+        });
+        self.api_key_editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text("", ctx);
+        });
+        self.schema = preset.schema;
+        self.schema_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_selected_by_name(preset.schema.display_name(), ctx);
+        });
+        self.url_has_error = false;
+        self.fetch_state = FetchState::Idle;
+        ctx.notify();
+    }
+
+    /// The preset whose base URL matches the current form, if any.
+    fn preset(&self, app: &AppContext) -> Option<&'static ProviderPreset> {
+        let url = self.endpoint_url_editor.as_ref(app).buffer_text(app);
+        preset_for_base_url(&url)
+    }
+
     pub fn on_open(&mut self, ctx: &mut ViewContext<Self>) {
         self.scroll_state.scroll_to(Pixels::zero());
-        self.focus_editor(&self.endpoint_name_editor, ctx);
+        // Preset endpoints arrive with a name and URL already filled in, so the
+        // API key is the only thing left to type.
+        if self.preset(ctx).is_some() {
+            self.focus_editor(&self.api_key_editor, ctx);
+        } else {
+            self.focus_editor(&self.endpoint_name_editor, ctx);
+        }
     }
 
     pub fn on_close(&mut self, ctx: &mut ViewContext<Self>) {
+        self.fetch_state = FetchState::Idle;
         self.endpoint_name_editor.update(ctx, |editor, ctx| {
             editor.clear_buffer_and_reset_undo_stack(ctx);
         });
@@ -719,6 +782,196 @@ impl CustomEndpointModal {
     }
 }
 
+impl CustomEndpointModal {
+    /// The "Fetch free models" button plus its status line, shown for preset
+    /// endpoints (and for endpoints whose URL matches a preset).
+    #[cfg(not(target_family = "wasm"))]
+    fn render_fetch_controls(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(12.);
+
+        if matches!(self.fetch_state, FetchState::Loading) {
+            row.add_child(
+                Text::new_inline(
+                    "Fetching free models...",
+                    appearance.ui_font_family(),
+                    LABEL_FONT_SIZE,
+                )
+                .with_color(theme.nonactive_ui_text_color().into())
+                .finish(),
+            );
+        } else {
+            let label = if matches!(self.fetch_state, FetchState::Loaded { .. }) {
+                "Refresh free models"
+            } else {
+                "Fetch free models"
+            };
+            row.add_child(
+                appearance
+                    .ui_builder()
+                    .button(
+                        ButtonVariant::Secondary,
+                        self.fetch_button_mouse_state.clone(),
+                    )
+                    .with_text_label(label.to_owned())
+                    .with_style(UiComponentStyles {
+                        font_size: Some(14.),
+                        padding: Some(Coords::uniform(6.).left(8.).right(8.)),
+                        ..Default::default()
+                    })
+                    .build()
+                    .on_click(|ctx, _, _| {
+                        ctx.dispatch_typed_action(CustomEndpointModalAction::FetchModels);
+                    })
+                    .finish(),
+            );
+        }
+
+        match &self.fetch_state {
+            FetchState::Loaded { shown, total } => {
+                let message = if *total == 0 {
+                    "No free models found".to_owned()
+                } else if shown < total {
+                    format!("Showing {shown} of {total} free models")
+                } else {
+                    format!("Found {total} free models")
+                };
+                row.add_child(
+                    Text::new_inline(message, appearance.ui_font_family(), LABEL_FONT_SIZE)
+                        .with_color(theme.nonactive_ui_text_color().into())
+                        .finish(),
+                );
+            }
+            FetchState::Failed(message) => {
+                row.add_child(
+                    Text::new_inline(
+                        message.clone(),
+                        appearance.ui_font_family(),
+                        LABEL_FONT_SIZE,
+                    )
+                    .with_color(theme.ui_error_color().into())
+                    .soft_wrap(true)
+                    .finish(),
+                );
+            }
+            FetchState::Idle | FetchState::Loading => {}
+        }
+
+        Container::new(row.finish())
+            .with_margin_bottom(16.)
+            .finish()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl CustomEndpointModal {
+    /// Requests the matching preset's catalog using the API key in the form and
+    /// replaces the model rows with the free models it returns.
+    fn fetch_free_models(&mut self, ctx: &mut ViewContext<Self>) {
+        if matches!(self.fetch_state, FetchState::Loading) {
+            return;
+        }
+        let Some(preset) = self.preset(ctx) else {
+            return;
+        };
+        let api_key = self.api_key_editor.as_ref(ctx).buffer_text(ctx);
+        self.fetch_state = FetchState::Loading;
+        ctx.notify();
+
+        let api_key = api_key.trim().to_owned();
+        ctx.spawn(
+            async move { ::ai::provider_models::fetch_free_models(preset, &api_key).await },
+            |me, result, ctx| me.handle_discovered_models(result, ctx),
+        );
+    }
+
+    fn handle_discovered_models(
+        &mut self,
+        result: Result<
+            Vec<::ai::provider_presets::DiscoveredModel>,
+            ::ai::provider_models::ModelDiscoveryError,
+        >,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match result {
+            Ok(models) => self.apply_discovered_models(models, ctx),
+            Err(error) => {
+                self.fetch_state = FetchState::Failed(error.user_message());
+                ctx.notify();
+            }
+        }
+    }
+
+    /// Rebuilds the model rows from a discovered catalog.
+    ///
+    /// Config keys are carried over from any row with the same model name, so
+    /// refreshing a catalog does not invalidate the user's default-model
+    /// selection or execution-profile overrides.
+    fn apply_discovered_models(
+        &mut self,
+        models: Vec<::ai::provider_presets::DiscoveredModel>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let existing_keys: std::collections::HashMap<String, String> = self
+            .model_rows
+            .iter()
+            .filter_map(|row| {
+                let config_key = row.config_key.clone()?;
+                let name = row.name_editor.as_ref(ctx).buffer_text(ctx);
+                Some((name.trim().to_owned(), config_key))
+            })
+            .collect();
+
+        let total = models.len();
+        let shown = total.min(::ai::provider_presets::MAX_DISCOVERED_MODELS);
+        let font_family = Appearance::as_ref(ctx).ui_font_family();
+        let text_colors = crate::settings_view::editor_text_colors(Appearance::as_ref(ctx));
+
+        self.model_rows.clear();
+        for model in models
+            .into_iter()
+            .take(::ai::provider_presets::MAX_DISCOVERED_MODELS)
+        {
+            let config_key = existing_keys.get(&model.id).cloned();
+            let row = Self::create_model_row(
+                Some(&model.id),
+                model.display_name.as_deref(),
+                config_key,
+                font_family,
+                &text_colors,
+                ctx,
+            );
+            Self::subscribe_to_model_row(&row, ctx);
+            self.model_rows.push(row);
+        }
+        if self.model_rows.is_empty() {
+            let row = Self::create_model_row(None, None, None, font_family, &text_colors, ctx);
+            Self::subscribe_to_model_row(&row, ctx);
+            self.model_rows.push(row);
+        }
+
+        self.fetch_state = FetchState::Loaded { shown, total };
+        ctx.notify();
+    }
+
+    /// Wires a freshly created model row's editors into the modal's navigation
+    /// and change handling.
+    fn subscribe_to_model_row(row: &ModelRow, ctx: &mut ViewContext<Self>) {
+        let name_editor = row.name_editor.clone();
+        ctx.subscribe_to_view(&name_editor, |me, editor, event, ctx| {
+            me.handle_model_editor_event(&editor, event, ctx);
+        });
+        let alias_editor = row.alias_editor.clone();
+        ctx.subscribe_to_view(&alias_editor, |me, editor, event, ctx| {
+            me.handle_model_editor_event(&editor, event, ctx);
+        });
+    }
+}
+
 impl Entity for CustomEndpointModal {
     type Event = CustomEndpointModalEvent;
 }
@@ -755,17 +1008,22 @@ impl View for CustomEndpointModal {
 
         let mut column = Flex::column();
 
-        // Description
+        // Description. Preset endpoints already know their name and URL, so
+        // point the user at the API-key page instead of asking them to fill in
+        // details we can fill in for them.
+        let description = match self.preset(app) {
+            Some(preset) => format!(
+                "{} Paste an API key below and fetch this provider's free models. Get a key at {}. Keys are stored only on this device.",
+                preset.description, preset.api_key_url
+            ),
+            None => "Provide your endpoint details below. You can add as many models from the endpoint as you'd like and can also provide aliases for the model picker in your input.".to_owned(),
+        };
         column.add_child(
             Container::new(
-                Text::new(
-                    "Provide your endpoint details below. You can add as many models from the endpoint as you'd like and can also provide aliases for the model picker in your input.",
-                    appearance.ui_font_family(),
-                    LABEL_FONT_SIZE,
-                )
-                .with_color(theme.nonactive_ui_text_color().into())
-                .soft_wrap(true)
-                .finish(),
+                Text::new(description, appearance.ui_font_family(), LABEL_FONT_SIZE)
+                    .with_color(theme.nonactive_ui_text_color().into())
+                    .soft_wrap(true)
+                    .finish(),
             )
             .with_margin_bottom(16.)
             .finish(),
@@ -857,6 +1115,13 @@ impl View for CustomEndpointModal {
             )
             .finish(),
         );
+
+        // Live catalog fetch for preset providers. Native only: model discovery
+        // uses the platform HTTP client, which is unavailable on wasm.
+        #[cfg(not(target_family = "wasm"))]
+        if self.preset(app).is_some() {
+            column.add_child(self.render_fetch_controls(app));
+        }
 
         // Model rows
         let has_remove_model_button = self.model_rows.len() > 1;
@@ -1108,6 +1373,10 @@ impl TypedActionView for CustomEndpointModal {
                 self.schema = *schema;
                 ctx.notify();
             }
+            CustomEndpointModalAction::FetchModels => {
+                #[cfg(not(target_family = "wasm"))]
+                self.fetch_free_models(ctx);
+            }
         }
     }
 }
@@ -1149,6 +1418,14 @@ impl CustomEndpointModalViewState {
         self.state.view.update(ctx, |modal, ctx| {
             modal.body().update(ctx, |body, ctx| {
                 body.prefill(endpoint, editing_index, ctx);
+            });
+        });
+    }
+
+    pub fn prefill_preset<T: View>(&mut self, preset: &ProviderPreset, ctx: &mut ViewContext<T>) {
+        self.state.view.update(ctx, |modal, ctx| {
+            modal.body().update(ctx, |body, ctx| {
+                body.prefill_preset(preset, ctx);
             });
         });
     }
