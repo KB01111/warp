@@ -39,7 +39,7 @@ impl ModelDiscoveryError {
 /// Models keep the provider's own ordering-independent ids; callers decide how
 /// many to surface (see [`crate::provider_presets::MAX_DISCOVERED_MODELS`]).
 pub async fn fetch_free_models(
-    preset: &'static ProviderPreset,
+    preset: &ProviderPreset,
     api_key: &str,
 ) -> Result<Vec<DiscoveredModel>, ModelDiscoveryError> {
     let api_key = api_key.trim();

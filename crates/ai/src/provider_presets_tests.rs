@@ -227,6 +227,18 @@ fn parse_model_catalog_skips_blank_and_duplicate_ids() {
 }
 
 #[test]
+fn parse_model_catalog_skips_non_chat_models() {
+    let body = r#"{ "data": [
+        { "id": "nvidia/llama-3.3-nemotron-super-49b" },
+        { "id": "nvidia/nv-embedqa-e5-v5" },
+        { "id": "nvidia/nv-rerankqa-mistral-4b-v3" },
+        { "id": "openai/whisper-large-v3" }
+    ] }"#;
+    let models = parse_model_catalog(&NVIDIA_BUILD, body).expect("catalog parses");
+    assert_eq!(models, vec![model("nvidia/llama-3.3-nemotron-super-49b")]);
+}
+
+#[test]
 fn parse_model_catalog_rejects_invalid_bodies() {
     assert!(parse_model_catalog(&OPENROUTER, "not json").is_err());
     assert!(parse_model_catalog(&OPENROUTER, r#"{ "models": [] }"#).is_err());

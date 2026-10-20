@@ -15,6 +15,9 @@
 - `parse_model_catalog` parses the OpenAI-shaped `GET {base_url}/models`
   response (also accepting a bare array), drops entries without an id,
   de-duplicates, filters to free models, and sorts by id.
+- Catalog entries whose ids look like non-chat models (`embed`, `rerank`,
+  `moderation`, `whisper`) are dropped, since they cannot serve a Chat
+  Completions request.
 - `FreeModelRule::All` treats every model as free (NVIDIA Build);
   `FreeModelRule::FreeIds` matches id suffixes and named ids, falling back to
   zero-price metadata (`pricing.*` or `cost.*`) when the catalog reports it.

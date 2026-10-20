@@ -23,6 +23,12 @@ use serde_json::Value;
 
 use crate::api_keys::CustomEndpointSchema;
 
+/// Id substrings that mark a catalog entry as something other than a chat
+/// model. Providers (NVIDIA Build especially) publish embedding, reranking,
+/// moderation, and speech models on the same `/models` endpoint, and none of
+/// them can serve a Chat Completions request.
+const NON_CHAT_MODEL_MARKERS: &[&str] = &["embed", "rerank", "moderation", "whisper"];
+
 /// The maximum number of discovered models surfaced to the UI at once.
 ///
 /// Some providers (notably NVIDIA Build) advertise well over a hundred models.
@@ -235,7 +241,10 @@ pub fn parse_model_catalog(
         else {
             continue;
         };
-        if !preset.is_free_model(id, Some(entry)) || !seen.insert(id.to_owned()) {
+        if is_non_chat_model(id)
+            || !preset.is_free_model(id, Some(entry))
+            || !seen.insert(id.to_owned())
+        {
             continue;
         }
         models.push(DiscoveredModel {
@@ -246,6 +255,15 @@ pub fn parse_model_catalog(
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(models)
+}
+
+/// Whether a model id looks like a non-chat model (embedding, reranker,
+/// moderation, or speech) that cannot serve a Chat Completions request.
+fn is_non_chat_model(id: &str) -> bool {
+    let id_lower = id.to_ascii_lowercase();
+    NON_CHAT_MODEL_MARKERS
+        .iter()
+        .any(|marker| id_lower.contains(marker))
 }
 
 /// Returns the catalog's display name for a model, when it adds information
