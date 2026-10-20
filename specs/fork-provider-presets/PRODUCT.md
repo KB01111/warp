@@ -56,3 +56,7 @@ provider-specific behavior" and "no model discovery" non-goals for this fork.
 7. Discovery failures surface inline in the editor (bad key, HTTP error,
    unreachable host, unparsable catalog) and leave the existing model rows
    intact so the user can still configure models manually.
+8. Presets use OpenAI Chat Completions. A provider whose free catalog mixes
+   protocols (for example an OpenCode model that only serves the Responses
+   API) may list a model that fails at request time; the schema stays
+   selectable in the editor and individual model rows can be removed.
